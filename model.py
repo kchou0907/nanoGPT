@@ -78,9 +78,13 @@ class CausalSelfAttention(nn.Module):
         ------Token pruning-----
         """
 
+        # Ensure entropy has correct shape (B, T) before using topk
+        if entropy.dim() == 1:
+            entropy = entropy.unsqueeze(0)  # Make sure entropy has shape (B, T) if it's flat
+
         # Token pruning based on entropy
         num_keep = int(T * prune_percent)
-        _, top_k_indices = torch.topk(entropy, num_keep, dim=1, largest=True, sorted=False)
+        _, top_k_indices = torch.topk(entropy, num_keep, dim=-1, largest=True, sorted=False)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
 
