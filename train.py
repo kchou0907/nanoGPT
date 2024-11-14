@@ -43,17 +43,20 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+
 # data
-dataset = 'openwebtext'
+dataset = 'enwik8'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+
 # model
 n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -61,6 +64,7 @@ weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -113,13 +117,19 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+#run prepare.py and ls -a to see all hidden files, the splits should be 90 5 5
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+test_data = np.memmap(os.path.join(data_dir, 'test.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        data = train_data
+    elif split == 'val':
+        data = val_data
+    else: # added test
+        data = test_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -130,9 +140,14 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+"""
+--------- KEEP TRACK OF BPC ----------
+"""
+
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
-best_val_loss = 1e9
+best_val_loss = 1e9 #keeps track of loss, we want btc
+best_bpc = 1e9 # also init to big num, note that this is for the TEST set
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -178,6 +193,7 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    best_bpc = checkpoint['best_bpc']#load bpc too
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -213,19 +229,25 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
-    out = {}
+def estimate_loss(): #get bpc here from model
+    all_losses, all_bpc = {}, {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in ['train', 'val', 'test']: #added test
         losses = torch.zeros(eval_iters)
+        bpcs = torch.zeros(eval_iters) # should be same shape, just loss / log2
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss, bpc = model(X, Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+            bpcs[k] = bpc.item()
+            #make bpc tensor
+
+        #add mean to bpc dictionary
+        all_losses[split] = losses.mean()
+        all_bpc[split] = bpcs.mean()
     model.train()
-    return out
+    return all_losses, all_bpc
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -261,28 +283,38 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses, bpcs = estimate_loss() #added bpc
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
+        if wandb_log: # add bpc as well as loss, for test too
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "test/loss": losses['test'],
+                "train/bpc": bpcs['train'],
+                "val/bpc": bpcs['val'],
+                "test/bpc": bpcs['test'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        #if losses['val'] < best_val_loss or always_save_checkpoint:
+        if bpcs['test'] < best_bpc or always_save_checkpoint: #just replace all loss stuff with bpc
+            #best_val_loss = losses['val']
+            oldbpc = best_bpc
+            best_bpc = bpcs['test']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
+                    'best_val_loss': best_val_loss, # keep but note might be wrong and not updated
+                    'best_bpc': best_bpc,
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
+                if best_bpc > oldbpc: #only print if best bpc got better
+                    print(f"new best bpc!!! ( {best_bpc} )")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
@@ -297,7 +329,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, bpcs= model(X, Y) #bpcs not used here
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
