@@ -315,7 +315,7 @@ while True:
         if bpcs['test'] < best_bpc or always_save_checkpoint: #just replace all loss stuff with bpc
             #best_val_loss = losses['val']
             oldbpc = best_bpc
-            bpcs['test'] = best_bpc
+            best_bpc = bpcs['test']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
