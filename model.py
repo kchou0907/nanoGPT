@@ -15,8 +15,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-FIXED_PRUNE_PERCENT = 0.7 # fixed pruning
-
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -51,42 +49,31 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, prune_percent=0.8):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # Calculate query, key, values
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            att = y.mean(dim=1).mean(dim=-1)
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
+            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v
-            att = att.mean(dim=1).mean(dim=-1)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-        # Calculate entropy for each token in sequence
-        entropy = -torch.sum(att * torch.log(att + 1e-10), dim=-1)
-
-        # Ensure entropy has correct shape (B, T) before using topk
-        if entropy.dim() == 1:
-            entropy = entropy.unsqueeze(0)  # Make sure entropy has shape (B, T) if it's flat
-
-        # Safe calculation of num_keep
-        num_keep = min(int(T * prune_percent), T)  # Ensure num_keep is not greater than T
-        _, top_k_indices = torch.topk(entropy, num_keep, dim=-1, largest=True, sorted=False)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
-
-        # Output projection
+        # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y, top_k_indices
+        return y
 
 class MLP(nn.Module):
 
@@ -105,9 +92,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    """
-    adjust to handle pruning
-    """
+
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -115,15 +100,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, prune_percent=0.8):
-        # Perform attention with token pruning
-        x_pruned, top_k_indices = self.attn(self.ln_1(x), prune_percent)
-
-        # Align the pruned output with MLP processing by padding back to original shape
-        padded_x = torch.zeros_like(x, dtype=x_pruned.dtype)  # Match dtype of x_pruned so scatter works
-        padded_x.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
-
-        x = x + padded_x
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -200,7 +178,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x, prune_percent=FIXED_PRUNE_PERCENT) #adjust prune %
+            x = block(x)
         x = self.transformer.ln_f(x)
 
         """
