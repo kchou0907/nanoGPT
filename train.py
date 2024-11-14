@@ -44,7 +44,7 @@ log_interval = 10 # don't print too too often
 eval_only = False # if True, script exits right after the first eval
 
 #switched dataset so toggle to true (false if small dataset and overfit)
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
@@ -67,6 +67,8 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
+
+""" keep large max_iter and monitor test bpc to see if beats baseline (watch out for convergence)"""
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -296,7 +298,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses, bpcs = estimate_loss() #added bpc
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train bpc: {bpcs['train']:.4f}, val bpc: {bpcs['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, test loss {losses['test']:.4f}, train bpc: {bpcs['train']:.4f}, val bpc: {bpcs['val']:.4f}, test bpc: {bpcs['test']:.4f}")
         if wandb_log: # add bpc as well as loss, for test too
             wandb.log({
                 "iter": iter_num,
@@ -313,7 +315,7 @@ while True:
         if bpcs['test'] < best_bpc or always_save_checkpoint: #just replace all loss stuff with bpc
             #best_val_loss = losses['val']
             oldbpc = best_bpc
-            best_bpc = bpcs['test']
+            bpcs['test'] = best_bpc
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -325,8 +327,8 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                if best_bpc > oldbpc: #only print if best bpc got better
-                    print(f"new best bpc!!! ( {best_bpc} )")
+                #if bpcs['test'] > oldbpc: #only print if best bpc got better
+                print(f"new best bpc!!! ( {best_bpc} )")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
