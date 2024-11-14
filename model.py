@@ -63,6 +63,7 @@ class CausalSelfAttention(nn.Module):
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            scores = y.mean(dim=1).mean(dim=-1)  # no attn so get scores from y
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -70,19 +71,22 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+            scores = att.mean(dim=1).mean(dim=-1)  # Average over heads and sequence positions
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         """
         ------Token pruning-----
         """
-        scores = att.mean(dim=1).mean(dim=-1)  # Average over heads and sequence positions
+
         num_keep = int(T * prune_percent) #get topk
-        _, top_indices = torch.topk(scores, num_keep, dim=1, sorted=False)
-        y = y.gather(1, top_indices.unsqueeze(-1).expand(-1, -1, C))
+        _, top_k_indices = torch.topk(scores, num_keep, dim=1, sorted=False)
+        y = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, top_k_indices # cntains the indices of the most important tokens after pruning
 
 class MLP(nn.Module):
 
@@ -113,11 +117,11 @@ class Block(nn.Module):
 
     def forward(self, x, prune_percent=0.8):
         # Perform attention with token pruning
-        x_pruned, top_indices = self.attn(self.ln_1(x), prune_percent)
+        x_pruned, top_k_indices = self.attn(self.ln_1(x), prune_percent)
 
         # Align the pruned output with MLP processing by padding back to original shape
         padded_x = torch.zeros_like(x)
-        padded_x.scatter_(1, top_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
+        padded_x.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
 
         x = x + padded_x
         x = x + self.mlp(self.ln_2(x))
