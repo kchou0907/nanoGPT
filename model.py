@@ -120,7 +120,7 @@ class Block(nn.Module):
         x_pruned, top_k_indices = self.attn(self.ln_1(x), prune_percent)
 
         # Align the pruned output with MLP processing by padding back to original shape
-        padded_x = torch.zeros_like(x)
+        padded_x = torch.zeros_like(x, dtype=x_pruned.dtype)  # Match dtype of x_pruned so scatter works
         padded_x.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
 
         x = x + padded_x
