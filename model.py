@@ -49,31 +49,43 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, x, adaptive_threshold=0.5):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # Calculate query, key, values as before
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # Causal self-attention logic as before
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            scores = y.mean(dim=1).mean(dim=-1)
         else:
-            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y = att @ v
+            scores = att.mean(dim=1).mean(dim=-1)
 
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Calculate token importance as variance over heads
+        importance_scores = scores.var(dim=1)
+        prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
+        top_k_indices = (importance_scores >= prune_threshold).nonzero(as_tuple=True)[1]
+
+        # Gather pruned tokens and align with output shape
+        y_pruned = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
+        padded_y = torch.zeros_like(y)
+        padded_y.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C), y_pruned)
+
+        # Output projection
+        y = self.resid_dropout(self.c_proj(padded_y))
+        return y, top_k_indices
+
 
 class MLP(nn.Module):
 
@@ -92,7 +104,9 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
+    """
+    adjust to handle pruning
+    """
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -101,7 +115,13 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        adaptive_threshold=0.5
+        x_pruned, top_k_indices = self.attn(self.ln_1(x), adaptive_threshold)
+        # Align pruned attention with MLP
+        padded_x = torch.zeros_like(x, dtype=x_pruned.dtype)
+        padded_x.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
+
+        x = x + padded_x
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -178,7 +198,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x) #adjust prune %
         x = self.transformer.ln_f(x)
 
         """
