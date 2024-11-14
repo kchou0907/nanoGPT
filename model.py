@@ -49,7 +49,8 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, prune_percent=0.8):
+        # add prune, parameter that determines the percentage of tokens to retain after each attention layer
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -70,6 +71,14 @@ class CausalSelfAttention(nn.Module):
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        """
+        ------Token pruning-----
+        """
+        scores = att.mean(dim=1).mean(dim=-1)  # Average over heads and sequence positions
+        num_keep = int(T * prune_percent) #get topk
+        _, top_indices = torch.topk(scores, num_keep, dim=1, sorted=False)
+        y = y.gather(1, top_indices.unsqueeze(-1).expand(-1, -1, C))
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -92,7 +101,9 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
+    """
+    adjust to handle pruning
+    """
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -100,8 +111,15 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, prune_percent=0.8):
+        # Perform attention with token pruning
+        x_pruned, top_indices = self.attn(self.ln_1(x), prune_percent)
+
+        # Align the pruned output with MLP processing by padding back to original shape
+        padded_x = torch.zeros_like(x)
+        padded_x.scatter_(1, top_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
+
+        x = x + padded_x
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -167,7 +185,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None): # return bpc here
+    def forward(self, idx, targets=None, prune_percent=0.8): # return bpc here
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -178,7 +196,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, prune_percent=prune_percent)
         x = self.transformer.ln_f(x)
 
         """
