@@ -53,14 +53,15 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 
 # data
 dataset = 'enwik8'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 5 #* 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
+# baby GPT model :)
+n_layer = 6
+n_head = 6
+n_embd = 384
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
@@ -256,7 +257,7 @@ def estimate_loss(): #get bpc here from model
 
         #add mean to bpc dictionary
         all_losses[split] = losses.mean()
-        all_bpc[split] = bpcs.mean()
+        all_bpc[split] = bpc.mean()
     model.train()
     return all_losses, all_bpc
 
@@ -340,7 +341,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, _ = model(X, Y) #bpcs not used here
+            logits, loss, bpc = model(X, Y) #bpcs not used here
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -364,10 +365,11 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        bpcf = bpc.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% , train bpc: {bpcs['train']:.4f}, val bpc: {bpcs['val']:.4f}")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% , bpc: {bpcf:.4f}")
     iter_num += 1
     local_iter_num += 1
 
