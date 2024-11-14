@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+FIXED_PRUNE_PERCENT = 0.7 # fixed pruning
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -50,43 +52,41 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x, prune_percent=0.8):
-        # add prune, parameter that determines the percentage of tokens to retain after each attention layer
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # Compute query, key, values
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            scores = y.mean(dim=1).mean(dim=-1)  # no attn so get scores from y
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            att = y.mean(dim=1).mean(dim=-1)  # Use mean attention values for entropy calculation
         else:
-            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v
+            att = att.mean(dim=1).mean(dim=-1)
 
-            scores = att.mean(dim=1).mean(dim=-1)  # Average over heads and sequence positions
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # Calculate entropy of attention distributions
+        entropy = -torch.sum(att * att.log(), dim=-1)
 
         """
         ------Token pruning-----
         """
 
-        num_keep = int(T * prune_percent) #get topk
-        _, top_k_indices = torch.topk(scores, num_keep, dim=1, sorted=False)
+        # Token pruning based on entropy
+        num_keep = int(T * prune_percent)
+        _, top_k_indices = torch.topk(entropy, num_keep, dim=1, largest=True, sorted=False)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
 
-        # output projection
+        # Output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y, top_k_indices # cntains the indices of the most important tokens after pruning
+        return y, top_k_indices
 
 class MLP(nn.Module):
 
@@ -189,7 +189,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, prune_percent=0.8): # return bpc here
+    def forward(self, idx, targets=None): # return bpc here
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -200,7 +200,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x, prune_percent=prune_percent)
+            x = block(x, prune_percent=FIXED_PRUNE_PERCENT) #adjust prune %
         x = self.transformer.ln_f(x)
 
         """
