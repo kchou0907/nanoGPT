@@ -52,9 +52,9 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x, prune_percent=0.8):
-        B, T, C = x.size()
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
 
-        # Compute query, key, values
+        # Calculate query, key, values
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -62,7 +62,7 @@ class CausalSelfAttention(nn.Module):
 
         if self.flash:
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            att = y.mean(dim=1).mean(dim=-1)  # Use mean attention values for entropy calculation
+            att = y.mean(dim=1).mean(dim=-1)
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
@@ -71,19 +71,15 @@ class CausalSelfAttention(nn.Module):
             y = att @ v
             att = att.mean(dim=1).mean(dim=-1)
 
-        # Calculate entropy of attention distributions
-        entropy = -torch.sum(att * att.log(), dim=-1)
-
-        """
-        ------Token pruning-----
-        """
+        # Calculate entropy for each token in sequence
+        entropy = -torch.sum(att * torch.log(att + 1e-10), dim=-1)
 
         # Ensure entropy has correct shape (B, T) before using topk
         if entropy.dim() == 1:
             entropy = entropy.unsqueeze(0)  # Make sure entropy has shape (B, T) if it's flat
 
-        # Token pruning based on entropy
-        num_keep = min(int(T * prune_percent), T)
+        # Safe calculation of num_keep
+        num_keep = min(int(T * prune_percent), T)  # Ensure num_keep is not greater than T
         _, top_k_indices = torch.topk(entropy, num_keep, dim=-1, largest=True, sorted=False)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
