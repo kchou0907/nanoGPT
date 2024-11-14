@@ -32,16 +32,23 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+
+"""
+-----Converted most of these to match train_shakespeare_char config-----
+    ->config should default to these global vars since im not passing in config file
+"""
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
+log_interval = 10 # don't print too too often
 eval_only = False # if True, script exits right after the first eval
+
+#switched dataset so toggle to true (false if small dataset and overfit)
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
-wandb_project = 'owt'
+wandb_project = 'enwik'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 
 # data
@@ -76,9 +83,13 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+#   THIS SHOULD NOT OVERWRITE! BECAUSE NOT PROVIDING CONFIG FILE! MANUALLY DEFINE CONFIGS ABOVE
+#exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -329,7 +340,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, bpcs= model(X, Y) #bpcs not used here
+            logits, loss, _ = model(X, Y) #bpcs not used here
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
