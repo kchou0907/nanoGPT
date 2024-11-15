@@ -49,7 +49,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, adaptive_threshold=0.5):
+    def forward(self, x, adaptive_threshold):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # Calculate query, key, values as before
@@ -74,13 +74,12 @@ class CausalSelfAttention(nn.Module):
 
         # Soft pruning by scaling based on importance scores
         importance_scores = scores.float()  # Keep shape as [B, T] without reduction
-        prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
-
-        # Create scaling mask based on importance scores
+        # Dynamic threshold based on the median of importance scores in each batch
+        prune_threshold = torch.median(importance_scores, dim=1, keepdim=True).values
         scale_factors = torch.where(
             importance_scores >= prune_threshold,
             torch.ones_like(importance_scores),
-            torch.ones_like(importance_scores) * 0.5  # Downscale less important tokens
+            importance_scores / prune_threshold
         )
 
         # Reshape scale_factors to match y's dimensions
@@ -122,7 +121,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        adaptive_threshold=0.5
+        adaptive_threshold=0.8
         x = x + self.attn(self.ln_1(x), adaptive_threshold)
         x = x + self.mlp(self.ln_2(x))
         return x
