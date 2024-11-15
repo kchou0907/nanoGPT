@@ -75,13 +75,18 @@ class CausalSelfAttention(nn.Module):
         # Calculate token importance as variance over heads
         importance_scores = scores.var(dim=1).float()  # Cast to float32
         prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
-        top_k_indices = (importance_scores >= prune_threshold).nonzero(as_tuple=True)[1]
 
+        # Find indices of tokens above the threshold
+        top_k_mask = importance_scores >= prune_threshold
+        top_k_indices = top_k_mask.nonzero(as_tuple=True)
+
+        # Ensure `top_k_indices` has values, else default to keeping all tokens
         if len(top_k_indices[0]) == 0:
-            # If no tokens meet the threshold, default to keeping all tokens
+            # If no tokens meet the threshold, retain all tokens
             top_k_indices = torch.arange(T, device=x.device).unsqueeze(0)
         else:
-            top_k_indices = top_k_indices[1]
+            # Only use the first dimension to avoid indexing errors
+            top_k_indices = top_k_indices[0].unsqueeze(0)
 
         # Gather pruned tokens and align with output shape
         y_pruned = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
