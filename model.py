@@ -58,7 +58,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Calculate causal self-attention
+        # Causal self-attention as before
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
             scores = y.mean(dim=1).mean(dim=-1)
@@ -72,18 +72,23 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Calculate token importance as variance and apply threshold
-        importance_scores = scores.var(dim=1).float()
+        # Soft pruning by scaling based on importance scores
+        importance_scores = scores.var(dim=1).float()  # Get variance for each token
         prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
-        top_k_mask = importance_scores >= prune_threshold
-        top_k_indices = top_k_mask.nonzero(as_tuple=True)[0]  # Get the 1D indices to avoid shape mismatch
 
-        # Use index_select to gather selected tokens
-        y_pruned = y.index_select(1, top_k_indices)
+        # Create scaling mask based on importance scores
+        scale_factors = torch.where(
+            importance_scores >= prune_threshold,
+            torch.ones_like(importance_scores),
+            torch.ones_like(importance_scores) * 0.5  # Downscale less important tokens
+        ).unsqueeze(-1)  # Reshape for broadcasting
 
-        # Output projection on pruned tokens
-        y_pruned = self.resid_dropout(self.c_proj(y_pruned))
-        return y_pruned, top_k_indices
+        # Apply the scaling factors to y
+        y = y * scale_factors
+
+        # Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
 class MLP(nn.Module):
@@ -115,16 +120,9 @@ class Block(nn.Module):
 
     def forward(self, x):
         adaptive_threshold=0.5
-        x_pruned, top_k_indices = self.attn(self.ln_1(x), adaptive_threshold)
-
-        # Create a padded output that aligns with original shape
-        output = torch.zeros_like(x)
-        output.index_copy_(1, top_k_indices, x_pruned)
-
-        x = x + output
+        x = x + self.attn(self.ln_1(x), adaptive_threshold)
         x = x + self.mlp(self.ln_2(x))
         return x
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
