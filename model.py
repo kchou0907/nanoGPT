@@ -73,7 +73,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # Calculate token importance as variance over heads
-        importance_scores = scores.var(dim=1)
+        importance_scores = scores.var(dim=1).float()  # Cast to float32
         prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
         top_k_indices = (importance_scores >= prune_threshold).nonzero(as_tuple=True)[1]
 
