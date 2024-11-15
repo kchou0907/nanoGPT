@@ -73,7 +73,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # Soft pruning by scaling based on importance scores
-        importance_scores = scores.var(dim=1).float()  # Get variance for each token
+        importance_scores = scores.float()  # Keep shape as [B, T] without reduction
         prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
 
         # Create scaling mask based on importance scores
@@ -84,7 +84,7 @@ class CausalSelfAttention(nn.Module):
         )
 
         # Reshape scale_factors to match y's dimensions
-        scale_factors = scale_factors.view(B, T, 1)  # Expand to [B, T, 1] to match y
+        scale_factors = scale_factors.unsqueeze(-1)
 
         # Apply the scaling factors to y
         y = y * scale_factors
