@@ -58,7 +58,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Causal self-attention logic as before
+        # Calculate causal self-attention
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
             scores = y.mean(dim=1).mean(dim=-1)
@@ -72,30 +72,18 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Calculate token importance as variance over heads
-        importance_scores = scores.var(dim=1).float()  # Cast to float32
+        # Calculate token importance as variance and apply threshold
+        importance_scores = scores.var(dim=1).float()
         prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
-
-        # Find indices of tokens above the threshold
         top_k_mask = importance_scores >= prune_threshold
-        top_k_indices = top_k_mask.nonzero(as_tuple=True)
+        top_k_indices = top_k_mask.nonzero(as_tuple=True)[0]  # Get the 1D indices to avoid shape mismatch
 
-        # Ensure `top_k_indices` has values, else default to keeping all tokens
-        if len(top_k_indices[0]) == 0:
-            # If no tokens meet the threshold, retain all tokens
-            top_k_indices = torch.arange(T, device=x.device).unsqueeze(0)
-        else:
-            # Only use the first dimension to avoid indexing errors
-            top_k_indices = top_k_indices[0].unsqueeze(0)
+        # Use index_select to gather selected tokens
+        y_pruned = y.index_select(1, top_k_indices)
 
-        # Gather pruned tokens and align with output shape
-        y_pruned = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
-        padded_y = torch.zeros_like(y)
-        padded_y.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C), y_pruned)
-
-        # Output projection
-        y = self.resid_dropout(self.c_proj(padded_y))
-        return y, top_k_indices
+        # Output projection on pruned tokens
+        y_pruned = self.resid_dropout(self.c_proj(y_pruned))
+        return y_pruned, top_k_indices
 
 
 class MLP(nn.Module):
@@ -128,11 +116,12 @@ class Block(nn.Module):
     def forward(self, x):
         adaptive_threshold=0.5
         x_pruned, top_k_indices = self.attn(self.ln_1(x), adaptive_threshold)
-        # Align pruned attention with MLP
-        padded_x = torch.zeros_like(x, dtype=x_pruned.dtype)
-        padded_x.scatter_(1, top_k_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), x_pruned)
 
-        x = x + padded_x
+        # Create a padded output that aligns with original shape
+        output = torch.zeros_like(x)
+        output.index_copy_(1, top_k_indices, x_pruned)
+
+        x = x + output
         x = x + self.mlp(self.ln_2(x))
         return x
 
