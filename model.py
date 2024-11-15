@@ -77,6 +77,12 @@ class CausalSelfAttention(nn.Module):
         prune_threshold = torch.quantile(importance_scores, 1 - adaptive_threshold)
         top_k_indices = (importance_scores >= prune_threshold).nonzero(as_tuple=True)[1]
 
+        if len(top_k_indices[0]) == 0:
+            # If no tokens meet the threshold, default to keeping all tokens
+            top_k_indices = torch.arange(T, device=x.device).unsqueeze(0)
+        else:
+            top_k_indices = top_k_indices[1]
+
         # Gather pruned tokens and align with output shape
         y_pruned = y.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, C))
         padded_y = torch.zeros_like(y)
