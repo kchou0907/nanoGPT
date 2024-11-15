@@ -81,7 +81,10 @@ class CausalSelfAttention(nn.Module):
             importance_scores >= prune_threshold,
             torch.ones_like(importance_scores),
             torch.ones_like(importance_scores) * 0.5  # Downscale less important tokens
-        ).unsqueeze(-1)  # Reshape for broadcasting
+        )
+
+        # Reshape scale_factors to match y's dimensions
+        scale_factors = scale_factors.view(B, T, 1)  # Expand to [B, T, 1] to match y
 
         # Apply the scaling factors to y
         y = y * scale_factors
