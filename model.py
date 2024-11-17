@@ -1,3 +1,4 @@
+
 """
 Full definition of a GPT Language Model, all of it in this single file.
 References:
@@ -60,9 +61,12 @@ class CausalSelfAttention(nn.Module):
 
         # Causal self-attention as before
         # scores represent token importance scores
-        if not self.flash:
+        if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-            scores = y.mean(dim=1).mean(dim=-1)
+
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = F.softmax(att, dim=-1)
+            scores = att.mean(dim=1).mean(dim=-1)
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
@@ -72,9 +76,15 @@ class CausalSelfAttention(nn.Module):
             scores = att.mean(dim=1).mean(dim=-1)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+        entropy = -torch.sum(att * torch.log(att + 1e-8), dim=-1)  # Shape: (B, n_head, T)
+        token_entropy = entropy.mean(dim=1)  # Aggregate across heads, Shape: (B, T)
+
+        # Invert entropy for importance scores
+        importance_scores = 1.0 / (token_entropy + 1e-8)  # Higher entropy means less importance
+
 
         # Soft pruning by scaling based on importance scores
-        importance_scores = scores.float()  # Keep shape as [B, T] without reduction
+        # importance_scores = scores.float()  # Keep shape as [B, T] without reduction
         # Dynamic threshold based on the median of importance scores in each batch
         prune_threshold = torch.median(importance_scores, dim=1, keepdim=True).values
         scale_factors = torch.where(
