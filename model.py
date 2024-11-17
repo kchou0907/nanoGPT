@@ -80,8 +80,7 @@ class CausalSelfAttention(nn.Module):
         token_entropy = entropy.mean(dim=1)  # Aggregate across heads, Shape: (B, T)
 
         # Invert entropy for importance scores
-        importance_scores = 1.0 / (token_entropy + 1e-8)  # Higher entropy means less importance
-
+        importance_scores = 1.0 / (token_entropy + 1e-2)  # Higher entropy means less importance
 
         # Soft pruning by scaling based on importance scores
         # importance_scores = scores.float()  # Keep shape as [B, T] without reduction
@@ -90,7 +89,7 @@ class CausalSelfAttention(nn.Module):
         scale_factors = torch.where(
             importance_scores >= prune_threshold,
             torch.ones_like(importance_scores),
-            importance_scores / prune_threshold
+            torch.clamp(importance_scores / prune_threshold, max=1.0)  # Limit scaling
         )
 
         # Reshape scale_factors to match y's dimensions
