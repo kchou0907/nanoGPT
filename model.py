@@ -53,49 +53,45 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # Calculate query, key, values as before
+        # Calculate query, key, values
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Causal self-attention as before
-        # scores represent token importance scores
+        # Causal self-attention
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = F.softmax(att, dim=-1)
-            scores = att.mean(dim=1).mean(dim=-1)
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-            scores = att.mean(dim=1).mean(dim=-1)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        entropy = -torch.sum(att * torch.log(att + 1e-8), dim=-1)  # Shape: (B, n_head, T)
-        token_entropy = entropy.mean(dim=1)  # Aggregate across heads, Shape: (B, T)
 
-        # Invert entropy for importance scores
-        importance_scores = 1.0 / (token_entropy + 1e-2)  # Higher entropy means less importance
+        # Calculate importance scores (variance-based)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = F.softmax(att, dim=-1)
+        importance_scores = att.var(dim=1)  # Variance across heads
 
-        # Soft pruning by scaling based on importance scores
-        # importance_scores = scores.float()  # Keep shape as [B, T] without reduction
-        # Dynamic threshold based on the median of importance scores in each batch
-        prune_threshold = torch.median(importance_scores, dim=1, keepdim=True).values
+        # Normalize importance scores
+        importance_scores = (importance_scores - importance_scores.min(dim=1, keepdim=True).values) / \
+                            (importance_scores.max(dim=1, keepdim=True).values - importance_scores.min(dim=1, keepdim=True).values + 1e-8)
+
+        # Dynamic threshold based on the median of importance scores
+        prune_threshold = torch.median(importance_scores, dim=1, keepdim=True).values  # Shape: (B, 1)
+
+        # Smooth scaling factors
         scale_factors = torch.where(
             importance_scores >= prune_threshold,
-            torch.ones_like(importance_scores),
-            importance_scores / prune_threshold
+            torch.ones_like(importance_scores),  # No pruning for important tokens
+            torch.clamp(importance_scores / prune_threshold, min=0.5)  # Ensure minimum scaling
         )
+        scale_factors = scale_factors.unsqueeze(-1)  # Reshape for broadcasting
 
-        # Reshape scale_factors to match y's dimensions
-        scale_factors = scale_factors.unsqueeze(-1)
-
-        # Apply the scaling factors to y
+        # Apply pruning
         y = y * scale_factors
 
         # Output projection
