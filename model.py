@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         token_importance = attention_importance * embedding_magnitude  # Combine attention and embedding
 
         # Dynamic threshold based on the 75th percentile of token importance
-        prune_threshold = torch.quantile(token_importance, 0.75, dim=1, keepdim=True)
+        prune_threshold = torch.quantile(token_importance, 0.9, dim=1, keepdim=True)
 
         # Scale factors for soft pruning
         scale_factors = torch.where(
