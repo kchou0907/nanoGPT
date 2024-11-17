@@ -49,7 +49,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, adaptive_threshold):
+    def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # Calculate query, key, values as before
@@ -59,6 +59,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         # Causal self-attention as before
+        # scores represent token importance scores
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
             scores = y.mean(dim=1).mean(dim=-1)
@@ -121,8 +122,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        adaptive_threshold=0.8
-        x = x + self.attn(self.ln_1(x), adaptive_threshold)
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 @dataclass

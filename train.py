@@ -85,8 +85,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-
+compile = False # use PyTorch 2.0 to compile the model to be faster
+#manual attn scores
 
 
 # -----------------------------------------------------------------------------
@@ -259,7 +259,7 @@ def estimate_loss(): #get bpc here from model
 
         #add mean to bpc dictionary
         all_losses[split] = losses.mean()
-        all_bpc[split] = bpc.mean()
+        all_bpc[split] = bpcs.mean()
     model.train()
     return all_losses, all_bpc
 
