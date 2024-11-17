@@ -60,7 +60,7 @@ class CausalSelfAttention(nn.Module):
 
         # Causal self-attention as before
         # scores represent token importance scores
-        if self.flash:
+        if not self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
             scores = y.mean(dim=1).mean(dim=-1)
         else:
