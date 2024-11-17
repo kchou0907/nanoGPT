@@ -75,20 +75,16 @@ class CausalSelfAttention(nn.Module):
         embedding_magnitude = torch.norm(q, dim=-1).mean(dim=1)  # Mean embedding magnitude across heads
         token_importance = attention_importance * embedding_magnitude  # Combine attention and embedding
 
-        # Dynamic threshold based on the 75th percentile of token importance
+        # Dynamic threshold based on the 90th percentile of token importance
         prune_threshold = torch.quantile(token_importance, 0.9, dim=1, keepdim=True)
 
-        # Scale factors for soft pruning
-        scale_factors = torch.where(
-            token_importance >= prune_threshold,
-            torch.ones_like(token_importance),
-            token_importance / prune_threshold
-        ).unsqueeze(-1)
+        # Hard pruning mask
+        prune_mask = (token_importance >= prune_threshold).float()  # Shape: (B, T)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Apply the scaling factors to y
-        y = y * scale_factors
+        # Apply the hard pruning mask
+        y = y * prune_mask.unsqueeze(-1)  # Mask pruned tokens completely
 
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
