@@ -89,7 +89,7 @@ class CausalSelfAttention(nn.Module):
         scale_factors = torch.where(
             importance_scores >= prune_threshold,
             torch.ones_like(importance_scores),
-            torch.clamp(importance_scores / prune_threshold, max=1.0)  # Limit scaling
+            importance_scores / prune_threshold
         )
 
         # Reshape scale_factors to match y's dimensions
