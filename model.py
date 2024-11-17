@@ -58,35 +58,32 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size()  # Batch size, sequence length, embedding size
+        B, T, C = x.size()
 
-        # Compute query, key, and value projections
+        # Compute query, key, value projections
         qkv = self.c_attn(x)
         qkv = qkv.view(B, T, 3, self.n_head, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)  # Each has shape (B, T, n_head, head_dim)
+        q, k, v = qkv.unbind(dim=2)
 
-        # Transpose to get (B, n_head, T, head_dim)
-        q = q.permute(0, 2, 1, 3)
+        # Transpose for attention computation
+        q = q.permute(0, 2, 1, 3)  # (B, n_head, T, head_dim)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
         # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # Shape: (B, n_head, T, T)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_head, T, T)
 
         # Apply adaptive attention span masks
-        # Clamp attention spans to valid range [1, max_span]
-        attention_spans = torch.clamp(self.attention_span, min=1, max=self.max_span).long()
-
-        # Create masks per head
         device = x.device
-        masks = torch.zeros(B, self.n_head, T, T, device=device)
-        for head_idx in range(self.n_head):
-            span = attention_spans[head_idx]
-            mask = torch.tril(torch.ones(T, T, device=device), diagonal=0)  # Causal mask
-            if span < T:
-                mask = mask - torch.triu(torch.ones(T, T, device=device), diagonal=span)
-                mask = torch.clamp(mask, min=0)
-            masks[:, head_idx, :, :] = mask  # Same mask for all batches
+        attention_spans = torch.clamp(self.attention_span, min=1, max=self.max_span).long()
+        position_ids = torch.arange(T, device=device).unsqueeze(0)
+        memory_position_ids = torch.arange(T, device=device).unsqueeze(1)
+        relative_distances = position_ids - memory_position_ids  # (T, T)
+        base_mask = (relative_distances >= 0).unsqueeze(0)  # (1, T, T)
+        attention_spans = attention_spans.view(-1, 1, 1)  # (n_head, 1, 1)
+        span_masks = (relative_distances >= - (attention_spans - 1))  # (n_head, T, T)
+        span_masks = span_masks & base_mask  # Combine with causal mask
+        masks = span_masks.unsqueeze(0).expand(B, -1, -1, -1)  # (B, n_head, T, T)
 
         # Apply masks to attention scores
         attn_scores = attn_scores.masked_fill(masks == 0, float('-inf'))
@@ -96,8 +93,8 @@ class CausalSelfAttention(nn.Module):
         attn_probs = self.attn_dropout(attn_probs)
 
         # Compute attention output
-        y = torch.matmul(attn_probs, v)  # Shape: (B, n_head, T, head_dim)
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)  # Reshape back to (B, T, C)
+        y = torch.matmul(attn_probs, v)  # (B, n_head, T, head_dim)
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)  # (B, T, C)
 
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
