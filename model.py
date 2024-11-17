@@ -41,14 +41,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-
-        self.head_dim = config.n_embd // config.n_head
-        self.max_span = config.block_size  # Maximum possible attention span
-        # Introduce learnable attention spans
-        self.attention_span = nn.Parameter(
-            torch.full((self.n_head,), fill_value=self.max_span, dtype=torch.float32)
-        )
-
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -58,48 +50,28 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size()
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # Compute query, key, value projections
-        qkv = self.c_attn(x)
-        qkv = qkv.view(B, T, 3, self.n_head, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # Transpose for attention computation
-        q = q.permute(0, 2, 1, 3)  # (B, n_head, T, head_dim)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_head, T, T)
-
-        # Apply adaptive attention span masks
-        device = x.device
-        attention_spans = torch.clamp(self.attention_span, min=1, max=self.max_span).long()
-        attention_spans = attention_spans.view(-1, 1, 1)  # (n_head, 1, 1)
-        # Compute relative distances
-        position_ids = torch.arange(T, device=device)
-        relative_positions = position_ids.unsqueeze(1) - position_ids.unsqueeze(0)  # (T, T)
-        relative_positions = relative_positions.unsqueeze(0).expand(self.n_head, -1, -1)  # (n_head, T, T)
-
-        # Create per-head masks
-        span_masks = (relative_positions >= 0) & (relative_positions <= attention_spans - 1)  # (n_head, T, T)
-
-        # Expand masks to match batch size
-        masks = span_masks.unsqueeze(0).expand(B, -1, -1, -1)  # (B, n_head, T, T)
-
-        # Apply masks to attention scores
-        attn_scores = attn_scores.masked_fill(masks == 0, float('-inf'))
-
-        # Compute attention probabilities
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.attn_dropout(attn_probs)
-
-        # Compute attention output
-        y = torch.matmul(attn_probs, v)  # (B, n_head, T, head_dim)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
-
-        # Output projection
+        # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -128,7 +100,15 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+        # Learnable weight for combining earlier layer outputs
+        self.alpha = nn.Parameter(torch.tensor(0.5))  # Initialized to equal contribution
+
+    def forward(self, x, previous_output=None):
+        # Combine current input with the representation from earlier layers
+        if previous_output is not None:
+            x = self.alpha * previous_output + (1 - self.alpha) * x
+
+        # Apply attention and MLP as usual
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -159,33 +139,16 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight  # Weight tying
 
-        # init all weights
+        # Init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
-        return n_params
+        # Report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -194,33 +157,33 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, Block):
+            torch.nn.init.constant_(module.alpha, 0.5)
 
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # Forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # Token embeddings
+        pos_emb = self.transformer.wpe(pos)  # Position embeddings
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        previous_output = None  # Initialize for the first layer
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, previous_output=previous_output)
+            previous_output = x  # Store for the next layer
+
         x = self.transformer.ln_f(x)
 
-        """
-        https://stats.stackexchange.com/questions/211858/how-to-compute-bits-per-character-bpc
-            bpc is just avg cross entropy with log base 2 (calculated below)
-        """
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             bpc = loss / math.log(2)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
             bpc = None
 
