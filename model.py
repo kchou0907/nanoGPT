@@ -49,31 +49,28 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, x): #return attn
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # Compute attention scores
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        if not self.flash:
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # Apply attention to values
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
+        # Output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, att  # Also return attention scores
+
 
 class MLP(nn.Module):
 
@@ -122,7 +119,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.boundary_predictor = nn.Linear(config.n_embd, 1)
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -167,85 +164,38 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def dynamic_pooling(self, x, boundary_probs, pooling_method="mean"):
-        """
-        Pool sequences dynamically based on predicted boundaries.
-
-        Args:
-            x (torch.Tensor): Input embeddings of shape (B, T, C).
-            boundary_probs (torch.Tensor): Boundary probabilities of shape (B, T, 1).
-            pooling_method (str): Pooling method, one of ['mean', 'max'].
-
-        Returns:
-            pooled_x (torch.Tensor): Dynamically pooled embeddings.
-            segment_masks (torch.Tensor): Mask indicating active segments.
-        """
-        B, T, C = x.shape
-        # Predict segment boundaries (binary thresholding)
-        boundaries = (boundary_probs > 0.5).int()  # Shape: (B, T, 1)
-
-        # Create segments
-        segment_ids = torch.cumsum(boundaries, dim=1)  # Segment IDs for each token
-        unique_segments = segment_ids.unique(dim=1)
-
-        # Aggregate embeddings within each segment
-        pooled_x = []
-        segment_masks = []
-        for batch_idx in range(B):
-            batch_segments = []
-            batch_masks = []
-            for seg_id in unique_segments[batch_idx]:
-                mask = (segment_ids[batch_idx] == seg_id).unsqueeze(-1)  # Shape: (T, 1)
-                if pooling_method == "mean":
-                    pooled_segment = (x[batch_idx] * mask).sum(dim=0) / mask.sum(dim=0)
-                elif pooling_method == "max":
-                    pooled_segment = (x[batch_idx] * mask).max(dim=0).values
-                batch_segments.append(pooled_segment)
-                batch_masks.append(mask.any(dim=0))
-            pooled_x.append(torch.stack(batch_segments, dim=0))
-            segment_masks.append(torch.stack(batch_masks, dim=0))
-        return torch.stack(pooled_x, dim=0), torch.stack(segment_masks, dim=0)
-
-
-    def forward(self, idx, targets=None, pooling_method="mean"):
+    def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        # Forward embeddings
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
+        attention_scores = []  # Store attention scores for pruning
 
-        # Predict boundaries
-        boundary_logits = self.boundary_predictor(x)  # Shape: (B, T, 1)
-        boundary_probs = torch.sigmoid(boundary_logits)  # Convert logits to probabilities
-
-        # Dynamic pooling
-        x_pooled, segment_masks = self.dynamic_pooling(x, boundary_probs, pooling_method)
-
-        # Pass through transformer blocks
         for block in self.transformer.h:
-            x_pooled = block(x_pooled)
+            x, att = block(x)
+            attention_scores.append(att)
 
-        # Final LayerNorm
-        x_pooled = self.transformer.ln_f(x_pooled)
+        # Dynamically prune tokens based on attention scores
+        avg_attention = torch.mean(torch.stack(attention_scores), dim=0)
+        prune_threshold = avg_attention.mean()  # Set threshold dynamically
+        x = x[:, avg_attention >= prune_threshold]  # Prune tokens
 
-        # Compute logits
-        logits = self.lm_head(x_pooled)
-
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        """
+        https://stats.stackexchange.com/questions/211858/how-to-compute-bits-per-character-bpc
+            bpc is just avg cross entropy with log base 2 (calculated below)
+        """
         if targets is not None:
-            # Compute loss only for active segments
-            active_targets = targets[segment_masks]
-            active_logits = logits[segment_masks]
-            loss = F.cross_entropy(active_logits.view(-1, logits.size(-1)), active_targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             bpc = loss / math.log(2)
+            return logits, loss, bpc
         else:
-            loss = None
-            bpc = None
+            return logits, None, None
 
-        return logits, loss, bpc
 
 
     def crop_block_size(self, block_size):
