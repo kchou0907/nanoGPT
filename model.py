@@ -26,39 +26,63 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
+class TokenPruning(nn.Module):
+    """Dynamic token pruning  to decide token importance dynamically."""
 
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.c_fc = nn.Linear(config.n_embd, config.n_embd // 2)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(config.n_embd // 2, 1)  # Output a score for each token
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        """
+        Args:
+            x: Tensor of shape (B, T, C) - input embeddings.
+        Returns:
+            pruning_scores: Tensor of shape (B, T) with scores for token pruning.
+        """
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        pruning_scores = self.c_proj(x).squeeze(-1)  # (B, T)
+        return pruning_scores
 
-        # Calculate query, key, values as before
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        # Token pruning
+        self.token_pruner = TokenPruning(config)
+
+        # Flash attention support
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            self.register_buffer(
+                "bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                .view(1, 1, config.block_size, config.block_size)
+            )
+
+    def forward(self, x):
+        B, T, C = x.size()  # Batch size, Sequence length, Embedding size
+
+        # Compute query, key, and value projections
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Causal self-attention as before
+        # Causal self-attention
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
@@ -68,27 +92,20 @@ class CausalSelfAttention(nn.Module):
             att = self.attn_dropout(att)
             y = att @ v
 
-        # Token importance: Combine attention scores with embedding magnitudes
-        att_weights = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att_weights = F.softmax(att_weights, dim=-1)
-        attention_importance = att_weights.sum(dim=1).sum(dim=-1)  # Sum attention across heads and sequence
-        embedding_magnitude = torch.norm(q, dim=-1).mean(dim=1)  # Mean embedding magnitude across heads
-        token_importance = attention_importance * embedding_magnitude  # Combine attention and embedding
-
-        # Dynamic threshold based on the 90th percentile of token importance
-        prune_threshold = torch.quantile(token_importance, 0.5, dim=1, keepdim=True)
-
-        # Hard pruning mask
-        prune_mask = (token_importance >= prune_threshold).float()  # Shape: (B, T)
-
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Apply the hard pruning mask
-        y = y * prune_mask.unsqueeze(-1)  # Mask pruned tokens completely
+        # Token pruning logic
+        pruning_scores = self.token_pruner(x)  # Compute scores for token pruning
+        pruning_probs = torch.sigmoid(pruning_scores)  # Convert scores to probabilities
+
+        # Dynamic soft pruning: scale outputs by pruning probabilities
+        scale_factors = pruning_probs.unsqueeze(-1)  # Shape (B, T, 1)
+        y = y * scale_factors
 
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 
 
 class MLP(nn.Module):
