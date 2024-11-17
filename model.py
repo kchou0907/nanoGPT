@@ -71,32 +71,30 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Calculate importance scores (variance-based)
+        # Calculate entropy
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = F.softmax(att, dim=-1)
-        importance_scores = att.var(dim=1)  # Variance across heads
+        entropy = -torch.sum(att * torch.log(att + 1e-8), dim=-1)  # Shape: (B, n_head, T)
+        token_entropy = entropy.mean(dim=1)  # Aggregate across heads, Shape: (B, T)
 
-        # Normalize importance scores
-        importance_scores = (importance_scores - importance_scores.min(dim=1, keepdim=True).values) / \
-                            (importance_scores.max(dim=1, keepdim=True).values - importance_scores.min(dim=1, keepdim=True).values + 1e-8)
+        # Normalize importance scores using percentile scaling
+        sorted_entropy, _ = token_entropy.sort(dim=1)  # Sort within each batch
+        percentile_threshold = int(0.5 * T)  # Take the median percentile (50%)
+        median_entropy = sorted_entropy[:, percentile_threshold]  # Shape: (B,)
 
-        # Dynamic threshold based on the median of importance scores
-        prune_threshold = torch.median(importance_scores, dim=1, keepdim=True).values  # Shape: (B, 1)
+        # Normalize based on the median entropy
+        importance_scores = torch.exp(-token_entropy / median_entropy.unsqueeze(1))  # Exponentially scale based on median
 
-        # Smooth scaling factors
-        scale_factors = torch.where(
-            importance_scores >= prune_threshold,
-            torch.ones_like(importance_scores),  # No pruning for important tokens
-            torch.clamp(importance_scores / prune_threshold, min=0.5)  # Ensure minimum scaling
-        )
-        scale_factors = scale_factors.unsqueeze(-1)  # Reshape for broadcasting
+        # Scale factors for token pruning
+        scale_factors = torch.clamp(importance_scores, min=0.5, max=1.0).unsqueeze(-1)  # Clamp values to avoid over-pruning
 
-        # Apply pruning
+        # Apply scaling
         y = y * scale_factors
 
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 
 
 class MLP(nn.Module):
