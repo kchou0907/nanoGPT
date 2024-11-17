@@ -26,87 +26,82 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class TokenPruning(nn.Module):
-    """Dynamic token pruning  to decide token importance dynamically."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, config.n_embd // 2)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(config.n_embd // 2, 1)  # Output a score for each token
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (B, T, C) - input embeddings.
-        Returns:
-            pruning_scores: Tensor of shape (B, T) with scores for token pruning.
-        """
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        pruning_scores = self.c_proj(x).squeeze(-1)  # (B, T)
-        return pruning_scores
-
-
 class CausalSelfAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head
-
+        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
 
-        # Token pruning
-        self.token_pruner = TokenPruning(config)
+        self.head_dim = config.n_embd // config.n_head
+        self.max_span = config.block_size  # Maximum possible attention span
+        # Introduce learnable attention spans
+        self.attention_span = nn.Parameter(
+            torch.full((self.n_head,), fill_value=self.max_span, dtype=torch.float32)
+        )
 
-        # Flash attention support
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
-            self.register_buffer(
-                "bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                .view(1, 1, config.block_size, config.block_size)
-            )
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size()  # Batch size, Sequence length, Embedding size
+        B, T, C = x.size()  # Batch size, sequence length, embedding size
 
         # Compute query, key, and value projections
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        qkv = self.c_attn(x)
+        qkv = qkv.view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)  # Each has shape (B, T, n_head, head_dim)
 
-        # Causal self-attention
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
+        # Transpose to get (B, n_head, T, head_dim)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # Compute attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # Shape: (B, n_head, T, T)
 
-        # Token pruning logic
-        pruning_scores = self.token_pruner(x)  # Compute scores for token pruning
-        pruning_probs = torch.sigmoid(pruning_scores)  # Convert scores to probabilities
+        # Apply adaptive attention span masks
+        # Clamp attention spans to valid range [1, max_span]
+        attention_spans = torch.clamp(self.attention_span, min=1, max=self.max_span).long()
 
-        # Dynamic soft pruning: scale outputs by pruning probabilities
-        scale_factors = pruning_probs.unsqueeze(-1)  # Shape (B, T, 1)
-        y = y * scale_factors
+        # Create masks per head
+        device = x.device
+        masks = torch.zeros(B, self.n_head, T, T, device=device)
+        for head_idx in range(self.n_head):
+            span = attention_spans[head_idx]
+            mask = torch.tril(torch.ones(T, T, device=device), diagonal=0)  # Causal mask
+            if span < T:
+                mask = mask - torch.triu(torch.ones(T, T, device=device), diagonal=span)
+                mask = torch.clamp(mask, min=0)
+            masks[:, head_idx, :, :] = mask  # Same mask for all batches
+
+        # Apply masks to attention scores
+        attn_scores = attn_scores.masked_fill(masks == 0, float('-inf'))
+
+        # Compute attention probabilities
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        # Compute attention output
+        y = torch.matmul(attn_probs, v)  # Shape: (B, n_head, T, head_dim)
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)  # Reshape back to (B, T, C)
 
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
-
-
 
 class MLP(nn.Module):
 
@@ -125,9 +120,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    """
-    adjust to handle pruning
-    """
+
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -139,6 +132,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -201,7 +195,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None): # return bpc here
+    def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -212,7 +206,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x) #adjust prune %
+            x = block(x)
         x = self.transformer.ln_f(x)
 
         """
