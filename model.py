@@ -76,13 +76,17 @@ class CausalSelfAttention(nn.Module):
         # Apply adaptive attention span masks
         device = x.device
         attention_spans = torch.clamp(self.attention_span, min=1, max=self.max_span).long()
-        position_ids = torch.arange(T, device=device).unsqueeze(0)
-        memory_position_ids = torch.arange(T, device=device).unsqueeze(1)
-        relative_distances = position_ids - memory_position_ids  # (T, T)
-        base_mask = (relative_distances >= 0).unsqueeze(0)  # (1, T, T)
         attention_spans = attention_spans.view(-1, 1, 1)  # (n_head, 1, 1)
-        span_masks = (relative_distances >= - (attention_spans - 1))  # (n_head, T, T)
-        span_masks = span_masks & base_mask  # Combine with causal mask
+        # Compute relative distances
+        position_ids = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+        memory_position_ids = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
+        relative_distances = position_ids - memory_position_ids  # (T, T)
+        relative_distances = relative_distances.unsqueeze(0).expand(self.n_head, -1, -1)  # (n_head, T, T)
+
+        # Create per-head masks
+        span_masks = (relative_distances >= 0) & (relative_distances < attention_spans)  # (n_head, T, T)
+
+        # Expand masks to match batch size
         masks = span_masks.unsqueeze(0).expand(B, -1, -1, -1)  # (B, n_head, T, T)
 
         # Apply masks to attention scores
