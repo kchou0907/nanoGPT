@@ -50,30 +50,50 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # Calculate query, key, values as before
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # Causal self-attention as before
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y = att @ v
 
-        # output projection
+        # Token importance: Combine attention scores with embedding magnitudes
+        att_weights = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att_weights = F.softmax(att_weights, dim=-1)
+        attention_importance = att_weights.sum(dim=1).sum(dim=-1)  # Sum attention across heads and sequence
+        embedding_magnitude = torch.norm(q, dim=-1).mean(dim=1)  # Mean embedding magnitude across heads
+        token_importance = attention_importance * embedding_magnitude  # Combine attention and embedding
+
+        # Dynamic threshold based on the 75th percentile of token importance
+        prune_threshold = torch.quantile(token_importance, 0.75, dim=1, keepdim=True)
+
+        # Scale factors for soft pruning
+        scale_factors = torch.where(
+            token_importance >= prune_threshold,
+            torch.ones_like(token_importance),
+            token_importance / prune_threshold
+        ).unsqueeze(-1)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Apply the scaling factors to y
+        y = y * scale_factors
+
+        # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 
 class MLP(nn.Module):
 
@@ -92,7 +112,9 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
+    """
+    adjust to handle pruning
+    """
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -104,7 +126,6 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -167,38 +188,36 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):  # return bpc here
+    def forward(self, idx, targets=None): # return bpc here
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # Forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x) #adjust prune %
         x = self.transformer.ln_f(x)
 
+        """
+        https://stats.stackexchange.com/questions/211858/how-to-compute-bits-per-character-bpc
+            bpc is just avg cross entropy with log base 2 (calculated below)
+        """
         if targets is not None:
+            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            probs = F.softmax(logits.view(-1, logits.size(-1)), dim=-1)
-
-            # Prune logits based on dynamic threshold
-            threshold = self.dynamic_threshold(probs)
-            logits[probs < threshold] = -float('Inf')
-
-            # Compute cross-entropy loss and bits-per-character
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             bpc = loss / math.log(2)
         else:
-            logits = self.lm_head(x[:, [-1], :])  # Inference-time optimization
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
 
         return logits, loss, bpc
-
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -328,12 +347,6 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-
-            #pruning
-            probs = F.softmax(logits, dim=-1) #recompute later
-            threshold = self.dynamic_threshold(probs)  # e.g., lambda probs: 0.01 + 0.1 * torch.std(probs)
-            logits[probs < threshold] = -float('Inf')
-
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
@@ -342,18 +355,3 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-    def dynamic_threshold(self, probs, context=None):
-        """
-        Calculates a dynamic threshold for token pruning.
-        Args:
-        - probs: Probabilities of the current token logits.
-        - context: Optional context (e.g., previous token probabilities).
-
-        Returns:
-        - Threshold value for pruning.
-        """
-        base_threshold = 0.01  # Minimum probability to retain a token
-        context_boost = 0.1 * torch.std(probs)  # Boost threshold based on distribution variability
-        return base_threshold + context_boost
-
