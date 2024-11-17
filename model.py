@@ -78,13 +78,12 @@ class CausalSelfAttention(nn.Module):
         attention_spans = torch.clamp(self.attention_span, min=1, max=self.max_span).long()
         attention_spans = attention_spans.view(-1, 1, 1)  # (n_head, 1, 1)
         # Compute relative distances
-        position_ids = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
-        memory_position_ids = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
-        relative_distances = position_ids - memory_position_ids  # (T, T)
-        relative_distances = relative_distances.unsqueeze(0).expand(self.n_head, -1, -1)  # (n_head, T, T)
+        position_ids = torch.arange(T, device=device)
+        relative_positions = position_ids.unsqueeze(1) - position_ids.unsqueeze(0)  # (T, T)
+        relative_positions = relative_positions.unsqueeze(0).expand(self.n_head, -1, -1)  # (n_head, T, T)
 
         # Create per-head masks
-        span_masks = (relative_distances >= 0) & (relative_distances < attention_spans)  # (n_head, T, T)
+        span_masks = (relative_positions >= 0) & (relative_positions <= attention_spans - 1)  # (n_head, T, T)
 
         # Expand masks to match batch size
         masks = span_masks.unsqueeze(0).expand(B, -1, -1, -1)  # (B, n_head, T, T)
@@ -98,7 +97,7 @@ class CausalSelfAttention(nn.Module):
 
         # Compute attention output
         y = torch.matmul(attn_probs, v)  # (B, n_head, T, head_dim)
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)  # (B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
 
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
