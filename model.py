@@ -51,7 +51,7 @@ class CausalSelfAttention(nn.Module): #attention mechanism
                                         .view(1, 1, config.block_size, config.block_size))
 
         # Fast Weight Memory parameter
-        self.eta = nn.Parameter(torch.tensor(0.01))  # Learning rate for fast weights
+        self.eta = nn.Parameter(torch.tensor(0.05))  # Learning rate for fast weights
         # play around with values, bigger val means more aggressive updates
 
 
