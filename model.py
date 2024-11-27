@@ -78,7 +78,7 @@ class CausalSelfAttention(nn.Module): #attention mechanism
 
         # Fast weights
         k = k / (k.norm(dim=-1, keepdim=True) + 1e-5)#Normalize keys
-        kv = torch.einsum('bnhtd,bnhtd->bnhted', v, k)  # Outer product at each time step
+        kv = torch.einsum('bnthd,bnthf->bnthdf', v, k)  # Outer product at each time step
         fast_weights = self.eta * kv.cumsum(dim=2)  # (B, n_head, T, head_dim, head_dim)
         q = q.unsqueeze(-1)  # (B, n_head, T, head_dim, 1)
         y = torch.matmul(fast_weights, q).squeeze(-1)  # (B, n_head, T, head_dim)
