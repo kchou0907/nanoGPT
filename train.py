@@ -32,49 +32,35 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-
-"""
------Converted most of these to match train_shakespeare_char config-----
-    ->config should default to these global vars since im not passing in config file
-"""
 out_dir = 'out'
-eval_interval = 250 # keep frequent because we'll overfit
+eval_interval = 2000
+log_interval = 1
 eval_iters = 200
-log_interval = 10 # don't print too too often
 eval_only = False # if True, script exits right after the first eval
-
-#switched dataset so toggle to true (false if small dataset and overfit)
-always_save_checkpoint = False # if True, always save a checkpoint after each eval
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = True # disabled by default
-wandb_project = 'enwik'
-wandb_run_name = 'gpt' # 'run' + str(time.time())
-
+wandb_log = False # disabled by default
+wandb_project = 'owt'
+wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'enwik8'
-gradient_accumulation_steps = 5 #* 8 # used to simulate larger batch sizes
+dataset = 'enwik'
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
-
 # model
-# baby GPT model :) -> larger model better for fast weight
 n_layer = 12
-n_head = 8
+n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
-
 # adamw optimizer
-learning_rate = 6e-4
-
-""" keep large max_iter and monitor test bpc to see if beats baseline (watch out for convergence)"""
+learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -86,13 +72,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
-#manual attn scores
-
-
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-#   THIS SHOULD NOT OVERWRITE! BECAUSE NOT PROVIDING CONFIG FILE! MANUALLY DEFINE CONFIGS ABOVE
-#exec(open('configurator.py').read()) # overrides from command line or config file
+exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 

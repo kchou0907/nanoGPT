@@ -26,6 +26,20 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class PostAttentionCompressor(nn.Module): #helps redundancy
+    """
+    Compresses the output of the attention mechanism into a lower-dimensional representation.
+    """
+    def __init__(self, d_model, compression_dim):
+        super().__init__()
+        self.compression = nn.Linear(d_model, compression_dim)
+        self.expansion = nn.Linear(compression_dim, d_model)
+
+    def forward(self, x):
+        compressed = self.compression(x)  # Reduce dimensionality
+        expanded = self.expansion(compressed)  # Restore dimensionality
+        return expanded
+
 class CausalSelfAttention(nn.Module): #attention mechanism
 
     def __init__(self, config):
@@ -50,10 +64,7 @@ class CausalSelfAttention(nn.Module): #attention mechanism
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-        # Fast Weight Memory parameter
-        self.eta = nn.Parameter(torch.tensor(0.05))  # Learning rate for fast weights
-        # play around with values, bigger val means more aggressive updates
-
+        self.compressor = PostAttentionCompressor(config.n_embd, compression_dim=config.n_embd // 2)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -65,29 +76,21 @@ class CausalSelfAttention(nn.Module): #attention mechanism
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # if self.flash:
-        #     # efficient attention using Flash Attention CUDA kernels
-        #     y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        # else:
-        #     # manual implementation of attention
-        #     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        #     att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        #     att = F.softmax(att, dim=-1)
-        #     att = self.attn_dropout(att)
-        #     y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        # Fast weights
-        k = k / (k.norm(dim=-1, keepdim=True) + 1e-5)#Normalize keys
-        kv = torch.einsum('b h t d, b h t e -> b h t d e', v, k)   # Outer product at each time step
-        #kv = v.unsqueeze(-1) * k.unsqueeze(-2)  #this might work too?
-        fast_weights = self.eta * kv.cumsum(dim=2)  # (B, n_head, T, head_dim, head_dim)
-        q = q.unsqueeze(-1)  # (B, n_head, T, head_dim, 1)
-        y = torch.matmul(fast_weights, q).squeeze(-1)  # (B, n_head, T, head_dim)
-
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        y = self.compressor(y)
         return y
 
 class MLP(nn.Module):
@@ -131,6 +134,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    compression_dim = int(n_embd * 0.5)
+
 
 class GPT(nn.Module):
 
