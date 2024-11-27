@@ -51,7 +51,7 @@ class CausalSelfAttention(nn.Module): #attention mechanism
                                         .view(1, 1, config.block_size, config.block_size))
 
         # Fast Weight Memory parameter
-        self.eta = nn.Parameter(torch.tensor(0.1))  # Learning rate for fast weights
+        self.eta = nn.Parameter(torch.tensor(0.01))  # Learning rate for fast weights
         # play around with values, bigger val means more aggressive updates
 
 
@@ -79,6 +79,7 @@ class CausalSelfAttention(nn.Module): #attention mechanism
         # Fast weights
         k = k / (k.norm(dim=-1, keepdim=True) + 1e-5)#Normalize keys
         kv = torch.einsum('b h t d, b h t e -> b h t d e', v, k)   # Outer product at each time step
+        #kv = v.unsqueeze(-1) * k.unsqueeze(-2)  #this might work too?
         fast_weights = self.eta * kv.cumsum(dim=2)  # (B, n_head, T, head_dim, head_dim)
         q = q.unsqueeze(-1)  # (B, n_head, T, head_dim, 1)
         y = torch.matmul(fast_weights, q).squeeze(-1)  # (B, n_head, T, head_dim)
