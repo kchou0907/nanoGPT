@@ -58,15 +58,15 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 
 # model
-# baby GPT model :)
-n_layer = 6
-n_head = 6
-n_embd = 384
+# baby GPT model :) -> larger model
+n_layer = 8
+n_head = 8
+n_embd = 512
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 2e-4 # fast weights might be unstable so reduce
 
 """ keep large max_iter and monitor test bpc to see if beats baseline (watch out for convergence)"""
 max_iters = 600000 # total number of training iterations
